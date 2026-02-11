@@ -2,11 +2,22 @@ import streamlit as st
 import pandas as pd
 from fredapi import Fred
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- CONFIGURATION INITIALE ---
-st.set_page_config(page_title="Central Bank Alpha Tool", layout="wide")
+# --- CONFIGURATION ET STYLE ---
+st.set_page_config(page_title="Global Macro Edge | Central Bank Terminal", layout="wide")
 
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; border-radius: 10px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .hawk-card { border-left: 5px solid #28a745; background-color: #e6ffed; padding: 15px; border-radius: 5px; }
+    .dove-card { border-left: 5px solid #dc3545; background-color: #fceaea; padding: 15px; border-radius: 5px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- GESTION API ---
 if "FRED_KEY" in st.secrets:
     API_KEY = st.secrets["FRED_KEY"]
 else:
@@ -15,113 +26,181 @@ else:
 try:
     fred = Fred(api_key=API_KEY)
 except Exception as e:
-    st.error(f"Erreur API : {e}")
+    st.error("Erreur de connexion API FRED")
     st.stop()
 
-# --- DEFINITION DES INDICES (CODES INTERNATIONAUX ROBUSTES) ---
-# J'ai remplacé les codes OCDE par des codes FMI ou de masse monétaire plus larges
+# --- CODES SÉRIES ROBUSTES ---
 central_banks = {
-    'USD (Fed)': {'rate': 'FEDFUNDS', 'cpi': 'CPIAUCSL', 'liq': 'WALCL'},
-    'EUR (ECB)': {'rate': 'ECBDFR', 'cpi': 'CP0000EZ19M086NEST', 'liq': 'ECBASSETSW'},
-    'JPY (BoJ)': {'rate': 'INTDSRJPM193N', 'cpi': 'JPNCPIALLMINMEI', 'liq': 'JPNASSETS'},
-    'GBP (BoE)': {'rate': 'IUDSOIA', 'cpi': 'GBRCPIALLMINMEI', 'liq': 'MANMM101GBM189S'},
-    'CAD (BoC)': {'rate': 'INTDSRCAM193N', 'cpi': 'CANCPIALLMINMEI', 'liq': 'MANMM101CAM189S'},
-    'AUD (RBA)': {'rate': 'INTDSRAUM193N', 'cpi': 'AUSCPIALLMINMEI', 'liq': 'MANMM101AUM189S'},
-    'CHF (SNB)': {'rate': 'INTDSRCHM193N', 'cpi': 'CHECPIALLMINMEI', 'liq': 'MABMM301CHM189S'}, # Utilisation M3 pour la Suisse
+    'USD (Fed)': {'rate': 'FEDFUNDS', 'cpi': 'CPIAUCSL', 'liq': 'WALCL', 'name': 'United States'},
+    'EUR (ECB)': {'rate': 'ECBDFR', 'cpi': 'CP0000EZ19M086NEST', 'liq': 'ECBASSETSW', 'name': 'Euro Area'},
+    'JPY (BoJ)': {'rate': 'IRSTCI01JPM156N', 'cpi': 'JPNCPIALLMINMEI', 'liq': 'JPNASSETS', 'name': 'Japan'},
+    'GBP (BoE)': {'rate': 'IUDSOIA', 'cpi': 'GBRCPIALLMINMEI', 'liq': 'MANMM101GBM189S', 'name': 'United Kingdom'},
+    'CAD (BoC)': {'rate': 'IRSTCI01CAM156N', 'cpi': 'CANCPIALLMINMEI', 'liq': 'MANMM101CAM189S', 'name': 'Canada'},
+    'AUD (RBA)': {'rate': 'IRSTCI01AUM156N', 'cpi': 'AUSCPIALLMINMEI', 'liq': 'MANMM101AUM189S', 'name': 'Australia'},
+    'CHF (SNB)': {'rate': 'IRSTCI01CHM156N', 'cpi': 'CHECPIALLMINMEI', 'liq': 'MABMM301CHM189S', 'name': 'Switzerland'},
 }
 
+# --- LOGIQUE DE CALCUL ---
+
 def calculate_z_score(series):
-    if series is None or len(series) < 5: return 0
-    clean_s = series.dropna()
-    if clean_s.empty: return 0
-    # On prend la dernière valeur non nulle
-    val = clean_s.iloc[-1]
-    mean = clean_s.mean()
-    std = clean_s.std()
-    return (val - mean) / std if std != 0 else 0
+    if series is None or len(series) < 5: return 0.0
+    clean_s = series.ffill().dropna()
+    if clean_s.empty: return 0.0
+    return (clean_s.iloc[-1] - clean_s.mean()) / clean_s.std()
 
 @st.cache_data(ttl=86400)
-def get_macro_data():
-    data = []
-    # On remonte un peu plus loin pour être sûr d'attraper les données trimestrielles (Australie)
-    start_date = datetime.now() - timedelta(days=365*6) 
+def fetch_all_data():
+    data_list = []
+    start_date = datetime.now() - timedelta(days=365*6)
     
-    progress_bar = st.progress(0, text="Récupération des données monde...")
-    
-    for i, (currency, codes) in enumerate(central_banks.items()):
-        row = {'Devise': currency, 'Taux (%)': 0, 'Z-Rate': 0, 'CPI (%)': 0, 'Z-CPI': 0, 'Liquidité (%)': 0, 'Z-Liq': 0, 'Macro Score': 0}
+    for currency, codes in central_banks.items():
         try:
-            # 1. TAUX (On force le remplissage des trous pour les séries quotidiennes/mensuelles)
+            # Récupération sécurisée
             s_rate = fred.get_series(codes['rate'], observation_start=start_date).ffill()
-            if s_rate.empty: raise ValueError("Taux vide")
-            row['Taux (%)'] = s_rate.iloc[-1]
-            row['Z-Rate'] = calculate_z_score(s_rate)
-
-            # 2. INFLATION (Calcul robuste pour données trimestrielles)
             s_cpi = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
-            # Pour l'Australie (trimestriel), on compare par rapport à 4 périodes au lieu de 12 si besoin
-            # Mais .pct_change(12) sur des données mensuelles "remplies" par ffill() marche très bien
-            cpi_yoy = s_cpi.pct_change(12).dropna() * 100
-            row['CPI (%)'] = cpi_yoy.iloc[-1]
-            row['Z-CPI'] = calculate_z_score(cpi_yoy)
-
-            # 3. LIQUIDITÉ
             s_liq = fred.get_series(codes['liq'], observation_start=start_date).ffill()
-            liq_chg = s_liq.pct_change(12).dropna() * 100
-            row['Liquidité (%)'] = liq_chg.iloc[-1]
-            row['Z-Liq'] = calculate_z_score(s_liq)
 
-            # FORMULE MACRO
-            row['Macro Score'] = (row['Z-Rate'] * 2.0) + (row['Z-CPI'] * 1.0) - (row['Z-Liq'] * 1.0)
-            data.append(row)
-        except Exception as e:
-            st.warning(f"Note : Certaines données pour {currency} sont arrivées avec du retard (Lag FRED).")
+            # Métriques
+            cur_rate = s_rate.iloc[-1]
+            z_rate = calculate_z_score(s_rate)
+            
+            cpi_yoy = s_cpi.pct_change(12).dropna() * 100
+            cur_cpi = cpi_yoy.iloc[-1]
+            z_cpi = calculate_z_score(cpi_yoy)
+            
+            liq_yoy = s_liq.pct_change(12).dropna() * 100
+            cur_liq = liq_yoy.iloc[-1]
+            z_liq = calculate_z_score(s_liq)
+
+            # Score composite
+            macro_score = (z_rate * 2.0) + (z_cpi * 1.0) - (z_liq * 1.0)
+
+            data_list.append({
+                'Devise': currency,
+                'Région': codes['name'],
+                'Taux (%)': cur_rate,
+                'CPI (%)': cur_cpi,
+                'Liquidité (%)': cur_liq,
+                'Z-Rate': z_rate,
+                'Z-CPI': z_cpi,
+                'Z-Liq': z_liq,
+                'Macro Score': macro_score
+            })
+        except:
             continue
-        
-        progress_bar.progress((i + 1) / len(central_banks))
-    
-    progress_bar.empty()
-    return pd.DataFrame(data).sort_values(by='Macro Score', ascending=False)
+    return pd.DataFrame(data_list).sort_values(by='Macro Score', ascending=False)
 
-# --- INTERFACE ---
-st.title("🏦 Central Bank Alpha Tool")
+# --- ENGINE START ---
+df = fetch_all_data()
 
-df = get_macro_data()
+# --- HEADER ---
+st.title("🏛️ Global Macro Edge")
+st.markdown(f"**Terminal de Surveillance des Banques Centrales** | Dernière mise à jour : {datetime.now().strftime('%d %b %Y')}")
+st.divider()
 
+# --- TOP KPI CARDS ---
+col1, col2, col3, col4 = st.columns(4)
 if not df.empty:
-    # 1. TABLEAU
-    st.header("1. Classement Hawk vs Dove")
-    st.dataframe(
-        df.style.map(lambda x: 'background-color: #d4edda' if isinstance(x, float) and x > 1.2 else ('background-color: #f8d7da' if isinstance(x, float) and x < -1.2 else ''), 
-                     subset=['Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score'])
-        .format("{:.2f}", subset=['Taux (%)', 'Z-Rate', 'CPI (%)', 'Z-CPI', 'Liquidité (%)', 'Z-Liq', 'Macro Score']),
-        use_container_width=True
-    )
-
-    # 2. STRENGTH METER
-    st.header("2. Currency Strength Meter")
-    fig_bar = px.bar(df, x='Macro Score', y='Devise', orientation='h', color='Macro Score', color_continuous_scale='RdYlGn')
-    fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-    # 3. OPPORTUNITÉS
-    st.header("3. Signaux de Divergence")
-    col1, col2 = st.columns(2)
     top_hawk = df.iloc[0]
     top_dove = df.iloc[-1]
-    col1.success(f"💪 **FORCE (Long) :** {top_hawk['Devise']}")
-    col2.error(f"📉 **FAIBLESSE (Short) :** {top_dove['Devise']}")
     
-    # scan des paires
-    trades = []
-    for i, row_l in df.iterrows():
-        for j, row_s in df.iterrows():
-            diff = row_l['Macro Score'] - row_s['Macro Score']
-            if diff > 2.5:
-                trades.append({'Paire': f"{row_l['Devise'][:3]}/{row_s['Devise'][:3]}", 'Score': round(diff, 2)})
-    
-    if trades:
-        st.table(pd.DataFrame(trades).sort_values(by='Score', ascending=False).head(5))
+    with col1:
+        st.metric("Top Hawkish (Strong)", top_hawk['Devise'], f"{top_hawk['Macro Score']:.2f}")
+    with col2:
+        st.metric("Top Dovish (Weak)", top_dove['Devise'], f"{top_dove['Macro Score']:.2f}", delta_color="inverse")
+    with col3:
+        spread = top_hawk['Macro Score'] - top_dove['Macro Score']
+        st.metric("Max Divergence", f"{spread:.2f}", "Potential Alpha")
+    with col4:
+        st.metric("Active Regions", len(df), "G10 Coverage")
 
-else:
-    st.error("Erreur critique : Aucune donnée n'a pu être récupérée. Vérifiez votre clé API FRED.")
+# --- MAIN TABS ---
+tab1, tab2, tab3 = st.tabs(["📊 Dashboard de Force", "🔍 Analyse Détaillée", "⚡ Signaux de Trading"])
+
+with tab1:
+    col_a, col_b = st.columns([2, 1])
+    
+    with col_a:
+        st.subheader("Currency Strength Meter")
+        fig_strength = px.bar(
+            df, x='Macro Score', y='Devise', orientation='h',
+            color='Macro Score', color_continuous_scale='RdYlGn',
+            template='plotly_white', height=500
+        )
+        fig_strength.update_layout(showlegend=False, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig_strength, use_container_width=True)
+
+    with col_b:
+        st.subheader("Positionnement Cyclique")
+        fig_scatter = px.scatter(
+            df, x="Z-CPI", y="Z-Rate", text="Devise", size=[30]*len(df),
+            color="Macro Score", color_continuous_scale='RdYlGn',
+            labels={'Z-CPI': 'Inflation Momentum', 'Z-Rate': 'Rate Tightness'}
+        )
+        fig_scatter.add_hline(y=0, line_dash="dash")
+        fig_scatter.add_vline(x=0, line_dash="dash")
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+with tab2:
+    st.subheader("Données Fondamentales Comparées")
+    # Style dynamique pour le tableau
+    formatted_df = df.copy()
+    st.dataframe(
+        df.style.background_gradient(cmap='RdYlGn', subset=['Macro Score', 'Z-Rate', 'Z-CPI'])
+        .format("{:.2f}", subset=['Taux (%)', 'CPI (%)', 'Liquidité (%)', 'Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score']),
+        use_container_width=True, height=400
+    )
+    
+    # Analyse textuelle
+    st.markdown("### 📝 Analyse de marché")
+    for _, row in df.iterrows():
+        sentiment = "Restrictif (Hawkish)" if row['Macro Score'] > 0 else "Accommodant (Dovish)"
+        with st.expander(f"Analyse approfondie : {row['Devise']}"):
+            st.write(f"La banque centrale de **{row['Région']}** affiche un score de **{row['Macro Score']:.2f}**.")
+            st.write(f"- **Taux :** Le Z-score de {row['Z-Rate']:.2f} indique que les taux sont {'élevés' if row['Z-Rate']>0 else 'bas'} par rapport à l'historique.")
+            st.write(f"- **Inflation :** À {row['CPI (%)']:.2f}%, l'inflation est {'une pression majeure' if row['Z-CPI']>1 else 'sous contrôle'}.")
+            st.write(f"- **Liquidité :** La variation de la masse monétaire ({row['Liquidité (%)']:.2f}%) suggère une {'contraction' if row['Z-Liq']<0 else 'expansion'} des liquidités.")
+
+with tab3:
+    st.subheader("Opportunités de Paires Forex")
+    
+    col_long, col_short = st.columns(2)
+    
+    with col_long:
+        st.markdown('<div class="hawk-card"><h4>🚀 OPPORTUNITÉS LONG</h4></div>', unsafe_allow_html=True)
+        for i in range(min(2, len(df))):
+            row = df.iloc[i]
+            st.write(f"**{row['Devise']}** : Score de force élevé ({row['Macro Score']:.2f}). Supporté par un différentiel de taux positif.")
+
+    with col_short:
+        st.markdown('<div class="dove-card"><h4>📉 OPPORTUNITÉS SHORT</h4></div>', unsafe_allow_html=True)
+        for i in range(1, min(3, len(df))):
+            row = df.iloc[-i]
+            st.write(f"**{row['Devise']}** : Score de faiblesse ({row['Macro Score']:.2f}). Pression baissière due à la politique monétaire.")
+
+    st.divider()
+    
+    # Générateur de paires
+    st.markdown("### 💱 Top Paires de Divergence")
+    paires = []
+    for i in range(len(df)):
+        for j in range(len(df)-1, i, -1):
+            s_long = df.iloc[i]
+            s_short = df.iloc[j]
+            diff = s_long['Macro Score'] - s_short['Macro Score']
+            if diff > 2.5:
+                paires.append({
+                    'Paire': f"{s_long['Devise'][:3]} / {s_short['Devise'][:3]}",
+                    'Intensité': diff,
+                    'Confiance': "Élevée 🔥" if diff > 4 else "Modérée ⚖️"
+                })
+    
+    if paires:
+        pair_df = pd.DataFrame(paires).sort_values(by='Intensité', ascending=False)
+        st.table(pair_df)
+    else:
+        st.info("Aucune divergence majeure détectée pour le moment.")
+
+# --- FOOTER ---
+st.divider()
+st.caption("Avertissement : Les calculs sont basés sur des données historiques normalisées (Z-Score). Ce terminal est un outil d'aide à la décision et ne constitue pas un conseil en investissement.")
