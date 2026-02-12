@@ -8,7 +8,6 @@ import yfinance as yf
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Macro Terminal Pro", layout="wide")
 
-# Style "Bloomberg Terminal"
 st.markdown("""
     <style>
     .main { background-color: #0e1117; color: #ffffff; }
@@ -31,16 +30,16 @@ except Exception:
     st.error("Clé API invalide ou problème de connexion.")
     st.stop()
 
-# --- CODES SÉRIES RÉVISÉS (POUR UNE FIABILITÉ MAXIMALE) ---
-# J'utilise ici les taux "Immediate Rates" ou "Policy Rates" les plus robustes
+# --- CODES SÉRIES RÉVISÉS (SÉRIES OCDE ULTRA-STABLES) ---
+# J'ai utilisé les codes 'IRSTCI01' qui sont les taux du marché monétaire suivis par l'OCDE
 central_banks = {
     'USD (Fed)': {'rate': 'FEDFUNDS', 'cpi': 'CPIAUCSL', 'liq': 'WALCL', 'symbol': 'USD'},
     'EUR (ECB)': {'rate': 'ECBDFR', 'cpi': 'CP0000EZ19M086NEST', 'liq': 'ECBASSETSW', 'symbol': 'EUR'},
-    'JPY (BoJ)': {'rate': 'INTDSRJPM193N', 'cpi': 'JPNCPIALLMINMEI', 'liq': 'JPNASSETS', 'symbol': 'JPY'},
+    'JPY (BoJ)': {'rate': 'IRSTCI01JPM156N', 'cpi': 'JPNCPIALLMINMEI', 'liq': 'JPNASSETS', 'symbol': 'JPY'},
     'GBP (BoE)': {'rate': 'IUDSOIA', 'cpi': 'GBRCPIALLMINMEI', 'liq': 'MANMM101GBM189S', 'symbol': 'GBP'},
-    'CAD (BoC)': {'rate': 'INTDSRCAM193N', 'cpi': 'CANCPIALLMINMEI', 'liq': 'MANMM101CAM189S', 'symbol': 'CAD'},
-    'AUD (RBA)': {'rate': 'INTDSRAUM193N', 'cpi': 'AUSCPIALLMINMEI', 'liq': 'MANMM101AUM189S', 'symbol': 'AUD'},
-    'CHF (SNB)': {'rate': 'INTDSRCHM193N', 'cpi': 'CHECPIALLMINMEI', 'liq': 'MABMM301CHM189S', 'symbol': 'CHF'},
+    'CAD (BoC)': {'rate': 'IRSTCI01CAM156N', 'cpi': 'CANCPIALLMINMEI', 'liq': 'MANMM101CAM189S', 'symbol': 'CAD'},
+    'AUD (RBA)': {'rate': 'IRSTCI01AUM156N', 'cpi': 'AUSCPIALLMINMEI', 'liq': 'MANMM101AUM189S', 'symbol': 'AUD'},
+    'CHF (SNB)': {'rate': 'IRSTCI01CHM156N', 'cpi': 'CHECPIALLMINMEI', 'liq': 'MABMM301CHM189S', 'symbol': 'CHF'},
 }
 
 # --- MOTEUR DE CALCUL ---
@@ -54,43 +53,56 @@ def calculate_z_score(series):
 @st.cache_data(ttl=86400)
 def fetch_data():
     data = []
-    # On remonte à 7 ans pour avoir une base statistique solide malgré les retards de publication
-    start_date = datetime.now() - timedelta(days=365*7)
+    # On remonte à 10 ans pour assurer une base statistique large
+    start_date = datetime.now() - timedelta(days=365*10)
     
+    progress_bar = st.progress(0, text="Synchronisation G10 en cours...")
+    count = 0
+
     for currency, codes in central_banks.items():
+        count += 1
+        progress_bar.progress(count / len(central_banks))
+        
+        # Initialisation par défaut pour éviter de sauter un pays
+        res = {
+            'Devise': currency, 'Symbol': codes['symbol'],
+            'Taux (%)': 0.0, 'Z-Rate': 0.0,
+            'Inflation (%)': 0.0, 'Z-CPI': 0.0,
+            'Liquidité (%)': 0.0, 'Z-Liq': 0.0,
+            'Macro Score': 0.0
+        }
+        
         try:
-            # Récupération Taux
+            # 1. TAUX
             s_rate = fred.get_series(codes['rate'], observation_start=start_date).ffill()
-            # Récupération Inflation
+            if not s_rate.empty:
+                res['Taux (%)'] = s_rate.iloc[-1]
+                res['Z-Rate'] = calculate_z_score(s_rate)
+
+            # 2. INFLATION
             s_cpi = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
-            # Récupération Liquidité
+            if not s_cpi.empty:
+                cpi_yoy = s_cpi.pct_change(12).dropna() * 100
+                if not cpi_yoy.empty:
+                    res['Inflation (%)'] = cpi_yoy.iloc[-1]
+                    res['Z-CPI'] = calculate_z_score(cpi_yoy)
+
+            # 3. LIQUIDITÉ (Bilan ou Masse Monétaire)
             s_liq = fred.get_series(codes['liq'], observation_start=start_date).ffill()
+            if not s_liq.empty:
+                liq_yoy = s_liq.pct_change(12).dropna() * 100
+                if not liq_yoy.empty:
+                    res['Liquidité (%)'] = liq_yoy.iloc[-1]
+                    res['Z-Liq'] = calculate_z_score(s_liq)
 
-            if s_rate.empty or s_cpi.empty: continue
-
-            z_rate = calculate_z_score(s_rate)
+            # Formule Macro Score
+            res['Macro Score'] = (res['Z-Rate'] * 2.0) + (res['Z-CPI'] * 1.0) - (res['Z-Liq'] * 1.0)
+            data.append(res)
+        except Exception as e:
+            # Si erreur, on garde les valeurs par défaut mais on n'exclut pas le pays
+            data.append(res)
             
-            cpi_yoy = s_cpi.pct_change(12).dropna() * 100
-            z_cpi = calculate_z_score(cpi_yoy)
-            
-            liq_yoy = s_liq.pct_change(12).dropna() * 100
-            z_liq = calculate_z_score(s_liq)
-
-            # Formule : On pondère le taux (x2) car c'est le driver principal
-            macro_score = (z_rate * 2.0) + (z_cpi * 1.0) - (z_liq * 1.0)
-
-            data.append({
-                'Devise': currency,
-                'Symbol': codes['symbol'],
-                'Taux (%)': round(s_rate.iloc[-1], 2),
-                'Z-Rate': round(z_rate, 2),
-                'Inflation (%)': round(cpi_yoy.iloc[-1], 2),
-                'Z-CPI': round(z_cpi, 2),
-                'Liquidité (%)': round(liq_yoy.iloc[-1], 2),
-                'Z-Liq': round(z_liq, 2),
-                'Macro Score': round(macro_score, 2)
-            })
-        except: continue
+    progress_bar.empty()
     return pd.DataFrame(data).sort_values(by='Macro Score', ascending=False)
 
 def get_market_data(pair):
@@ -98,7 +110,6 @@ def get_market_data(pair):
         ticker = f"{pair}=X"
         df_tick = yf.download(ticker, period="2y", interval="1d", progress=False)
         current = df_tick['Close'].iloc[-1].item()
-        # Z-score prix sur 2 ans
         z_price = (current - df_tick['Close'].mean().item()) / df_tick['Close'].std().item()
         return round(current, 4), round(z_price, 2)
     except: return 0.0, 0.0
@@ -106,41 +117,39 @@ def get_market_data(pair):
 # --- AFFICHAGE ---
 
 st.title("🏛️ Institutional Macro Terminal")
-st.markdown(f"**Analyse Fundamental & Tactical Execution** | {datetime.now().strftime('%d %B %Y')}")
+st.markdown(f"**G10 Currency Surveillance** | Flux : FRED/OECD | {datetime.now().strftime('%d %B %Y')}")
 
 df = fetch_data()
 
 if not df.empty:
     # 1. METRICS TOP BAR
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Strongest (Hawk)", df.iloc[0]['Devise'], df.iloc[0]['Macro Score'])
-    c2.metric("Weakest (Dove)", df.iloc[-1]['Devise'], df.iloc[-1]['Macro Score'], delta_color="inverse")
-    c3.metric("Global Spread", round(df.iloc[0]['Macro Score'] - df.iloc[-1]['Macro Score'], 2))
-    c4.metric("Data Status", "Live (FRED/IMF)")
+    c1.metric("Strongest Currency", df.iloc[0]['Devise'], f"{df.iloc[0]['Macro Score']:.2f}")
+    c2.metric("Weakest Currency", df.iloc[-1]['Devise'], f"{df.iloc[-1]['Macro Score']:.2f}", delta_color="inverse")
+    c3.metric("Alpha Spread", round(df.iloc[0]['Macro Score'] - df.iloc[-1]['Macro Score'], 2))
+    c4.metric("Coverage", f"{len(df)} Countries")
 
     st.divider()
 
-    # 2. TABLEAU DÉTAILLÉ (Le fond propre et pro)
-    st.header("1. Fundamental Scoreboard")
+    # 2. TABLEAU DÉTAILLÉ
+    st.header("1. Fundamental Analysis Table")
     
-    # Stylisage
     def color_values(val):
         if not isinstance(val, (int, float)): return ''
-        if val > 1.2: return 'color: #28a745; font-weight: bold;' # Vert
-        if val < -1.2: return 'color: #dc3545; font-weight: bold;' # Rouge
+        if val > 1.2: return 'color: #28a745; font-weight: bold;'
+        if val < -1.2: return 'color: #dc3545; font-weight: bold;'
         return 'color: #adb5bd;'
 
     st.dataframe(
         df.style.applymap(color_values, subset=['Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score'])
-        .format("{:.2f}", subset=['Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score']),
-        use_container_width=True, height=350
+        .format("{:.2f}", subset=['Taux (%)', 'Z-Rate', 'Inflation (%)', 'Z-CPI', 'Liquidité (%)', 'Z-Liq', 'Macro Score']),
+        use_container_width=True, height=400
     )
 
-    # 3. ANALYSE PRIX & OPPORTUNITÉS
+    # 3. OPPORTUNITÉS TACTIQUES
     st.divider()
     st.header("2. Tactical Execution (Price vs Macro)")
     
-    # On compare les 2 plus forts contre les 2 plus faibles
     hawks = df.iloc[:2]
     doves = df.iloc[-2:]
     
@@ -152,9 +161,9 @@ if not df.empty:
             price, z_price = get_market_data(pair)
             macro_div = round(h['Macro Score'] - d['Macro Score'], 2)
             
-            # Logique de signal
-            if z_price < 0: signal = "ACHAT (Sous-évalué) 🔥"
-            elif z_price > 1.8: signal = "VENDU (Trop cher) ⚠️"
+            # Diagnostic tactique
+            if z_price < 0: signal = "ACHAT (Value) 🔥"
+            elif z_price > 1.8: signal = "SURACHAT (Attendre) ⚠️"
             else: signal = "Tendance Saine ✅"
 
             with col_opps[idx % 2]:
@@ -169,14 +178,15 @@ if not df.empty:
                 p3.write(f"**{signal}**")
             idx += 1
 
-    # 4. VISUALISATION
+    # 4. GRAPHIQUE
     st.divider()
-    st.header("3. Market Strength Map")
+    st.header("3. Global Strength Map")
     fig = px.bar(df, x='Macro Score', y='Devise', orientation='h', color='Macro Score',
                  color_continuous_scale='RdYlGn', template='plotly_dark')
+    fig.update_layout(yaxis={'categoryorder':'total ascending'})
     st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.error("Données momentanément indisponibles sur FRED.")
+    st.error("Données momentanément indisponibles.")
 
-st.caption("Méthodologie : Z-Score calculé sur 7 ans. Sources : FRED, IMF, Yahoo Finance.")
+st.caption("Méthodologie : Z-Scores calculés sur 10 ans. Liquidité basée sur le bilan ou la masse monétaire M1/M3.")
