@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from fredapi import Fred
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import yfinance as yf
 
@@ -11,11 +10,8 @@ st.set_page_config(page_title="Macro Alpha Terminal", layout="wide")
 
 st.markdown("""
     <style>
-    /* Global Theme */
     .main { background-color: #0e1117; color: #ffffff; }
     .stMetric { background-color: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 15px; }
-    
-    /* Card Style */
     .opp-card {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -25,8 +21,6 @@ st.markdown("""
     }
     .hawk-tag { color: #238636; font-weight: bold; background: #23863622; padding: 4px 8px; border-radius: 4px; }
     .dove-tag { color: #da3633; font-weight: bold; background: #da363322; padding: 4px 8px; border-radius: 4px; }
-    
-    /* Typography */
     h1, h2, h3 { color: #f0f6fc; font-family: 'Inter', sans-serif; }
     .text-muted { color: #8b949e; font-size: 0.9em; }
     </style>
@@ -44,7 +38,7 @@ except:
     st.error("Erreur API FRED")
     st.stop()
 
-# --- CODES SÉRIES G10 (STABLES) ---
+# --- CODES SÉRIES G10 (SÉRIES OCDE & M1 POUR STABILITÉ) ---
 central_banks = {
     'USD (Fed)': {'rate': 'FEDFUNDS', 'cpi': 'CPIAUCSL', 'liq': 'WALCL', 'symbol': 'USD'},
     'EUR (ECB)': {'rate': 'ECBDFR', 'cpi': 'CP0000EZ19M086NEST', 'liq': 'ECBASSETSW', 'symbol': 'EUR'},
@@ -58,7 +52,7 @@ central_banks = {
 # --- BACKEND ---
 
 def calculate_z_score(series):
-    if series is None or len(series) < 10: return 0.0
+    if series is None or len(series) < 5: return 0.0
     clean = series.ffill().dropna()
     return (clean.iloc[-1] - clean.mean()) / clean.std() if not clean.empty else 0.0
 
@@ -67,25 +61,38 @@ def fetch_macro():
     data = []
     start_date = datetime.now() - timedelta(days=365*8)
     for currency, codes in central_banks.items():
+        row = {
+            'Devise': currency, 'Symbol': codes['symbol'],
+            'Taux (%)': 0.0, 'Z-Rate': 0.0, 'CPI (%)': 0.0, 
+            'Z-CPI': 0.0, 'Liq/Masse (%)': 0.0, 'Z-Liq': 0.0, 'Macro Score': 0.0
+        }
         try:
-            r = fred.get_series(codes['rate'], observation_start=start_date).ffill()
-            c = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
-            l = fred.get_series(codes['liq'], observation_start=start_date).ffill()
+            # Récupération individuelle pour ne pas bloquer le pays si une série échoue
+            try:
+                r = fred.get_series(codes['rate'], observation_start=start_date).ffill()
+                row['Taux (%)'] = r.iloc[-1]
+                row['Z-Rate'] = calculate_z_score(r)
+            except: pass
+
+            try:
+                c = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
+                c_yoy = c.pct_change(12).dropna() * 100
+                row['CPI (%)'] = c_yoy.iloc[-1]
+                row['Z-CPI'] = calculate_z_score(c_yoy)
+            except: pass
+
+            try:
+                l = fred.get_series(codes['liq'], observation_start=start_date).ffill()
+                l_yoy = l.pct_change(12).dropna() * 100
+                row['Liq/Masse (%)'] = l_yoy.iloc[-1]
+                row['Z-Liq'] = calculate_z_score(l)
+            except: pass
             
-            c_yoy = c.pct_change(12).dropna() * 100
-            l_yoy = l.pct_change(12).dropna() * 100
-            
-            z_r, z_c, z_l = calculate_z_score(r), calculate_z_score(c_yoy), calculate_z_score(l)
-            score = (z_r * 2.0) + (z_c * 1.0) - (z_l * 1.0)
-            
-            data.append({
-                'Devise': currency, 'Symbol': codes['symbol'],
-                'Taux (%)': r.iloc[-1], 'Z-Rate': z_r,
-                'CPI (%)': c_yoy.iloc[-1], 'Z-CPI': z_c,
-                'Liq/Masse (%)': l_yoy.iloc[-1], 'Z-Liq': z_l,
-                'Macro Score': score
-            })
-        except: continue
+            # Calcul du score global
+            row['Macro Score'] = (row['Z-Rate'] * 2.0) + (row['Z-CPI'] * 1.0) - (row['Z-Liq'] * 1.0)
+            data.append(row)
+        except:
+            data.append(row)
     return pd.DataFrame(data).sort_values(by='Macro Score', ascending=False)
 
 def fetch_price(pair):
@@ -107,7 +114,7 @@ if not df.empty:
     m1.metric("Strongest", df.iloc[0]['Symbol'], f"{df.iloc[0]['Macro Score']:.2f}")
     m2.metric("Weakest", df.iloc[-1]['Symbol'], f"{df.iloc[-1]['Macro Score']:.2f}", delta_color="inverse")
     m3.metric("Max Divergence", round(df.iloc[0]['Macro Score'] - df.iloc[-1]['Macro Score'], 2))
-    m4.metric("Market Mode", "High Vol" if abs(df['Macro Score'].max()) > 3 else "Neutral")
+    m4.metric("Active Assets", len(df), "G10 Coverage")
 
     tab1, tab2, tab3 = st.tabs(["📊 Force Relative", "🎯 Opportunités Tactiques", "📑 Données Fondamentales"])
 
@@ -121,62 +128,62 @@ if not df.empty:
         
         with col_right:
             st.subheader("Visualisation du Cycle (G10)")
-            # LE GRAPHIQUE DU CYCLE
             fig_cycle = px.scatter(df, x="Z-CPI", y="Z-Rate", text="Symbol", size=[20]*len(df),
                                    color="Macro Score", color_continuous_scale='RdYlGn',
                                    labels={'Z-CPI': 'Inflation Momentum (Z)', 'Z-Rate': 'Rate Tightness (Z)'},
                                    template='plotly_dark')
             fig_cycle.add_hline(y=0, line_dash="dash", line_color="#444")
             fig_cycle.add_vline(x=0, line_dash="dash", line_color="#444")
-            # Annotations des quadrants
-            fig_cycle.add_annotation(x=2, y=2, text="HAWKISH", showarrow=False, font=dict(color="green"))
-            fig_cycle.add_annotation(x=-2, y=-2, text="DOVISH", showarrow=False, font=dict(color="red"))
             st.plotly_chart(fig_cycle, use_container_width=True)
 
     with tab2:
-        st.header("⚡ Signaux d'Exécution Détaillés")
-        # Logique de paires
-        hawks = df.iloc[:2]
-        doves = df.iloc[-2:]
+        st.header("⚡ Opportunités Classées par Divergence")
         
-        for _, h in hawks.iterrows():
-            for _, d in doves.iterrows():
-                pair_name = f"{h['Symbol']}{d['Symbol']}"
-                price, z_price = fetch_price(pair_name)
+        # Génération et classement des paires
+        opps = []
+        for i in range(len(df)):
+            for j in range(len(df)-1, i, -1):
+                h = df.iloc[i]
+                d = df.iloc[j]
                 div_score = h['Macro Score'] - d['Macro Score']
-                
-                # Couleur du signal
-                sig_text = "CONVENTIONNEL"
-                if z_price < -1: sig_text = "VALEUR EXTRÊME 🔥"
-                elif z_price > 1.5: sig_text = "SUR-ACHAT / ATTENDRE ⚠️"
+                if div_score > 1.5: # On garde les divergences significatives
+                    opps.append((h, d, div_score))
+        
+        # Tri par divergence décroissante
+        opps.sort(key=lambda x: x[2], reverse=True)
 
-                with st.container():
-                    st.markdown(f"""
-                    <div class="opp-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-size: 1.5em; font-weight: bold;">{h['Symbol']} / {d['Symbol']}</span>
-                            <span class="hawk-tag">{sig_text}</span>
-                        </div>
-                        <div style="display: flex; gap: 40px; margin-top: 15px;">
-                            <div><span class="text-muted">Divergence Macro</span><br><b>{div_score:.2f}</b></div>
-                            <div><span class="text-muted">Prix Actuel</span><br><b>{price}</b></div>
-                            <div><span class="text-muted">Z-Score Prix (2y)</span><br><b style="color: {'#238636' if z_price < 0 else '#da3633'}">{z_price}</b></div>
-                            <div><span class="text-muted">Confiance</span><br><b>{'Haute' if div_score > 3.5 else 'Moyenne'}</b></div>
-                        </div>
-                        <div style="margin-top: 15px; border-top: 1px solid #30363d; padding-top: 10px;">
-                            <span class="text-muted">LOGIQUE :</span><br>
-                            L'achat de <b>{h['Symbol']}</b> est supporté par un différentiel de taux de <b>{(h['Taux (%)']-d['Taux (%)']):.2f}%</b>. 
-                            Le prix est actuellement <b>{'sous' if z_price < 0 else 'au-dessus'}</b> de sa moyenne historique de 2 ans.
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+        for h, d, div_score in opps[:6]: # Affiche le Top 6
+            pair_name = f"{h['Symbol']}{d['Symbol']}"
+            price, z_price = fetch_price(pair_name)
+            
+            sig_text = "TENDANCE"
+            if z_price < -1: sig_text = "VALEUR EXTRÊME 🔥"
+            elif z_price > 1.5: sig_text = "SUR-ACHAT ⚠️"
+
+            st.markdown(f"""
+            <div class="opp-card">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 1.5em; font-weight: bold;">{h['Symbol']} / {d['Symbol']}</span>
+                    <span class="hawk-tag">{sig_text}</span>
+                </div>
+                <div style="display: flex; gap: 40px; margin-top: 15px;">
+                    <div><span class="text-muted">Divergence Macro</span><br><b style="font-size: 1.2em;">{div_score:.2f}</b></div>
+                    <div><span class="text-muted">Prix Actuel</span><br><b>{price}</b></div>
+                    <div><span class="text-muted">Z-Score Prix (2y)</span><br><b style="color: {'#238636' if z_price < 0 else '#da3633'}">{z_price}</b></div>
+                    <div><span class="text-muted">Confiance</span><br><b>{'Haute' if div_score > 3.5 else 'Moyenne'}</b></div>
+                </div>
+                <div style="margin-top: 15px; border-top: 1px solid #30363d; padding-top: 10px;">
+                    <span class="text-muted">ANALYSE :</span> 
+                    Achat de <b>{h['Symbol']}</b> contre <b>{d['Symbol']}</b>. 
+                    Le différentiel de taux est de <b>{(h['Taux (%)']-d['Taux (%)']):.2f}%</b>.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
     with tab3:
         st.subheader("Fundamental Analysis Ledger")
-        # Tableau détaillé comme demandé
-        styled_df = df.copy()
         st.dataframe(
-            styled_df.style.map(lambda x: 'color: #238636; font-weight: bold' if isinstance(x, float) and x > 1.2 else ('color: #da3633; font-weight: bold' if isinstance(x, float) and x < -1.2 else ''), 
+            df.style.map(lambda x: 'color: #238636; font-weight: bold' if isinstance(x, float) and x > 1.2 else ('color: #da3633; font-weight: bold' if isinstance(x, float) and x < -1.2 else ''), 
                                 subset=['Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score'])
             .format("{:.2f}", subset=['Taux (%)', 'Z-Rate', 'CPI (%)', 'Z-CPI', 'Liq/Masse (%)', 'Z-Liq', 'Macro Score']),
             use_container_width=True, height=450
@@ -185,4 +192,4 @@ if not df.empty:
 else:
     st.error("Échec de la synchronisation des données.")
 
-st.caption(f"Terminal G10 | {datetime.now().strftime('%Y-%m-%d %H:%M')} | Basé sur les cycles de 8 ans.")
+st.caption(f"Terminal G10 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
