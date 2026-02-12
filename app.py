@@ -6,17 +6,18 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import yfinance as yf
 
-# --- CONFIGURATION ET STYLE ---
-st.set_page_config(page_title="Global Macro Edge | Central Bank Terminal", layout="wide")
+# --- CONFIGURATION ET STYLE PROFESSIONNEL ---
+st.set_page_config(page_title="Global Macro Terminal", layout="wide")
 
+# Style CSS pour un rendu "Terminal Bloomberg/Reuters" (Fond sombre, texte clair)
 st.markdown("""
     <style>
-    .main { background-color: #f4f7f9; }
-    .stMetric { background-color: #ffffff; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-    .hawk-card { border-left: 6px solid #28a745; background-color: #ffffff; padding: 20px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); margin-bottom: 15px; }
-    .dove-card { border-left: 6px solid #dc3545; background-color: #ffffff; padding: 20px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); margin-bottom: 15px; }
-    .opportunity-card { border: 1px solid #e0e0e0; background-color: #ffffff; padding: 15px; border-radius: 10px; margin-bottom: 10px; }
-    h1, h2, h3 { color: #1e293b; font-family: 'Inter', sans-serif; }
+    .main { background-color: #0e1117; color: #ffffff; }
+    .stMetric { background-color: #1c2128; border: 1px solid #30363d; border-radius: 8px; padding: 15px; }
+    div[data-testid="stMetricValue"] { color: #58a6ff; font-size: 28px; }
+    .status-box { padding: 20px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #30363d; }
+    h1, h2, h3 { color: #f0f6fc; }
+    .stDataFrame { border: 1px solid #30363d; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -32,7 +33,7 @@ except Exception:
     st.error("Erreur de connexion API FRED.")
     st.stop()
 
-# --- CODES SÉRIES ---
+# --- CODES SÉRIES (Version Stable & Détaillée) ---
 central_banks = {
     'USD (Fed)': {'rate': 'FEDFUNDS', 'cpi': 'CPIAUCSL', 'liq': 'WALCL', 'symbol': 'USD'},
     'EUR (ECB)': {'rate': 'ECBDFR', 'cpi': 'CP0000EZ19M086NEST', 'liq': 'ECBASSETSW', 'symbol': 'EUR'},
@@ -46,128 +47,155 @@ central_banks = {
 # --- FONCTIONS DE CALCUL ---
 
 def calculate_z_score(series):
-    if series is None or len(series) < 5: return 0.0
+    if series is None or len(series) < 10: return 0.0
     clean_s = series.ffill().dropna()
-    return (clean_s.iloc[-1] - clean_s.mean()) / clean_s.std() if not clean_s.empty else 0.0
+    if clean_s.empty: return 0.0
+    return (clean_s.iloc[-1] - clean_s.mean()) / clean_s.std()
 
 @st.cache_data(ttl=86400)
-def fetch_macro_data():
+def fetch_full_macro():
     data_list = []
     start_date = datetime.now() - timedelta(days=365*6)
     for currency, codes in central_banks.items():
         try:
+            # Récupération
             s_rate = fred.get_series(codes['rate'], observation_start=start_date).ffill()
             s_cpi = fred.get_series(codes['cpi'], observation_start=start_date).ffill()
             s_liq = fred.get_series(codes['liq'], observation_start=start_date).ffill()
 
-            macro_score = (calculate_z_score(s_rate) * 2.0) + (calculate_z_score(s_cpi.pct_change(12)) * 1.0) - (calculate_z_score(s_liq.pct_change(12)) * 1.0)
+            # Calculs
+            z_rate = calculate_z_score(s_rate)
+            
+            cpi_yoy = s_cpi.pct_change(12).dropna() * 100
+            z_cpi = calculate_z_score(cpi_yoy)
+            
+            liq_yoy = s_liq.pct_change(12).dropna() * 100
+            z_liq = calculate_z_score(s_liq)
+
+            score = (z_rate * 2.0) + (z_cpi * 1.0) - (z_liq * 1.0)
+
             data_list.append({
-                'Devise': currency, 'Symbol': codes['symbol'],
-                'Taux (%)': s_rate.iloc[-1], 'CPI (%)': (s_cpi.pct_change(12).iloc[-1]*100),
-                'Macro Score': macro_score, 'Z-Rate': calculate_z_score(s_rate)
+                'Devise': currency,
+                'Symbol': codes['symbol'],
+                'Taux (%)': s_rate.iloc[-1],
+                'Z-Rate': z_rate,
+                'CPI (%)': cpi_yoy.iloc[-1],
+                'Z-CPI': z_cpi,
+                'Liq/Masse M. (%)': liq_yoy.iloc[-1],
+                'Z-Liq': z_liq,
+                'Macro Score': score
             })
         except: continue
     return pd.DataFrame(data_list).sort_values(by='Macro Score', ascending=False)
 
-def get_price_z_score(pair_name):
-    """Calcule le Z-score du prix actuel par rapport à la moyenne 2 ans"""
+def fetch_price_data(pair):
     try:
-        ticker = f"{pair_name}=X"
-        data = yf.download(ticker, period="2y", interval="1d", progress=False)
-        if data.empty: return 0.0, 0.0
-        current_price = data['Close'].iloc[-1].item() # Correction pour extraire la valeur scalaire
-        mean_price = data['Close'].mean().item()
-        std_price = data['Close'].std().item()
-        z_price = (current_price - mean_price) / std_price
-        return round(current_price, 4), round(z_price, 2)
-    except:
-        return 0.0, 0.0
+        ticker = f"{pair}=X"
+        d = yf.download(ticker, period="2y", interval="1d", progress=False)
+        if d.empty: return 0, 0
+        current = float(d['Close'].iloc[-1])
+        z_price = (current - d['Close'].mean()) / d['Close'].std()
+        return round(current, 4), round(float(z_price), 2)
+    except: return 0, 0
 
-# --- ENGINE ---
-df_macro = fetch_macro_data()
+# --- Lancement du moteur ---
+df = fetch_full_macro()
 
 # --- INTERFACE ---
-st.title("🏛️ Institutional Macro Terminal")
-st.markdown(f"**Analyse Fundamental & Tactical Execution** | {datetime.now().strftime('%d %B %Y')}")
+st.title("🏛️ Global Macro Alpha Terminal")
+st.markdown(f"**Données Institutionnelles** | Flux : FRED & Yahoo Finance | Mise à jour : {datetime.now().strftime('%d/%m/%Y')}")
+
+# Section KPI
+if not df.empty:
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Strongest (Hawk)", df.iloc[0]['Devise'], f"{df.iloc[0]['Macro Score']:.2f}")
+    k2.metric("Weakest (Dove)", df.iloc[-1]['Devise'], f"{df.iloc[-1]['Macro Score']:.2f}", delta_color="inverse")
+    k3.metric("Max Spread", f"{(df.iloc[0]['Macro Score'] - df.iloc[-1]['Macro Score']):.2f}")
+    k4.metric("Market State", "Divergence" if abs(df['Macro Score'].mean()) < 2 else "Trend")
+
 st.divider()
 
-# KPI Top Bar
-if not df_macro.empty:
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Strongest Currency", df_macro.iloc[0]['Devise'], f"Score: {df_macro.iloc[0]['Macro Score']:.2f}")
-    m2.metric("Weakest Currency", df_macro.iloc[-1]['Devise'], f"Score: {df_macro.iloc[-1]['Macro Score']:.2f}", delta_color="inverse")
-    m3.metric("Alpha Spread", f"{(df_macro.iloc[0]['Macro Score'] - df_macro.iloc[-1]['Macro Score']):.2f}")
-    m4.metric("Market Sentiment", "Risk-On" if df_macro.iloc[0]['Symbol'] != 'USD' else "Risk-Off")
+# --- SECTION 1 : TABLEAU DÉTAILLÉ (Le coeur de l'outil) ---
+st.header("1. Analyse Fondamentale Détaillée")
+st.markdown("Ce tableau compare les politiques monétaires via le Z-Score (écart à la moyenne sur 5 ans).")
 
-# TABS
-tab1, tab2, tab3 = st.tabs(["📊 Force Relative", "🎯 Opportunités Tactiques", "📑 Rapport Détaillé"])
+# Stylisage du tableau pour visibilité max
+def color_macro(val):
+    if not isinstance(val, (int, float)): return ''
+    color = '#1c2128'
+    if val > 1.2: color = '#14522d' # Vert sombre
+    elif val < -1.2: color = '#611623' # Rouge sombre
+    return f'background-color: {color}'
 
-with tab1:
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        fig_strength = px.bar(df_macro, x='Macro Score', y='Devise', orientation='h', color='Macro Score', 
-                             color_continuous_scale='RdYlGn', title="Global Currency Strength Meter")
-        st.plotly_chart(fig_strength, use_container_width=True)
-    with col_b:
-        st.markdown("### 💡 Analyse Flash")
-        top_h = df_macro.iloc[0]
-        st.info(f"**{top_h['Devise']}** domine le marché. Ses fondamentaux suggèrent une poursuite de la force via le différentiel de taux.")
+st.dataframe(
+    df.style.applymap(color_macro, subset=['Z-Rate', 'Z-CPI', 'Z-Liq', 'Macro Score'])
+    .format("{:.2f}", subset=['Taux (%)', 'Z-Rate', 'CPI (%)', 'Z-CPI', 'Liq/Masse M. (%)', 'Z-Liq', 'Macro Score']),
+    use_container_width=True, height=350
+)
 
-with tab2:
-    st.header("⚡ Opportunités Macro + Prix (Z-Score)")
-    st.write("Cette section croise la macroéconomie (Fondamental) avec la position du prix (Technique).")
-    
-    # On génère les paires candidates
-    pairs_to_analyze = []
-    for i in range(min(3, len(df_macro))):
-        for j in range(len(df_macro)-1, len(df_macro)-3, -1):
-            if i != j:
-                pairs_to_analyze.append((df_macro.iloc[i], df_macro.iloc[j]))
+st.divider()
 
-    c_op1, c_op2 = st.columns(2)
-    
-    for idx, (long_cur, short_cur) in enumerate(pairs_to_analyze[:4]):
-        pair_name = f"{long_cur['Symbol']}{short_cur['Symbol']}"
-        price, z_price = get_price_z_score(pair_name)
+# --- SECTION 2 : GRAPHIQUE DE FORCE ---
+st.header("2. Force Relative des Devises")
+col_bar, col_scat = st.columns([1, 1])
+
+with col_bar:
+    fig_bar = px.bar(df, x='Macro Score', y='Devise', orientation='h', color='Macro Score',
+                     color_continuous_scale='RdYlGn', template='plotly_dark')
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+with col_scat:
+    fig_scat = px.scatter(df, x="Z-CPI", y="Z-Rate", text="Devise", size=[25]*len(df),
+                          color="Macro Score", color_continuous_scale='RdYlGn', template='plotly_dark',
+                          title="Cycle : Inflation vs Taux")
+    fig_scat.add_hline(y=0, line_dash="dash")
+    fig_scat.add_vline(x=0, line_dash="dash")
+    st.plotly_chart(fig_scat, use_container_width=True)
+
+st.divider()
+
+# --- SECTION 3 : OPPORTUNITÉS TACTIQUES (MACRO + PRIX) ---
+st.header("3. Signaux d'Exécution (Divergence vs Prix)")
+st.markdown("On cherche les paires où la **Macro est forte** mais le **Prix est encore bas** (Z-Score Prix < 0).")
+
+# Génération des meilleures paires (Top Hawk vs Top Dove)
+best_hawk = df.iloc[:2]
+best_dove = df.iloc[-2:]
+
+opportunities = []
+for _, h in best_hawk.iterrows():
+    for _, d in best_dove.iterrows():
+        pair = f"{h['Symbol']}{d['Symbol']}"
+        price, z_price = fetch_price_data(pair)
+        macro_div = h['Macro Score'] - d['Macro Score']
         
-        target_col = c_op1 if idx % 2 == 0 else c_op2
+        # Logique de signal
+        if z_price < -1: signal = "ACHAT D'OR (Sous-évalué) 🔥"
+        elif z_price < 0: signal = "ACHAT (Value) ✅"
+        elif z_price > 1.5: signal = "SURACHAT (Attendre repli) ⚠️"
+        else: signal = "Tendance Confirmée 📈"
         
-        with target_col:
-            st.markdown(f"""
-            <div class="hawk-card">
-                <b>PAIRE : {long_cur['Symbol']} / {short_cur['Symbol']}</b><br>
-                <span style="font-size: 0.9em; color: #64748b;">Divergence Macro : {(long_cur['Macro Score'] - short_cur['Macro Score']):.2f}</span>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Prix Actuel", price)
-            
-            # Couleur du Z-Price
-            z_color = "normal"
-            if z_price > 1.5: z_color = "inverse" # Cher
-            elif z_price < -1.5: z_color = "normal" # Pas cher
-            
-            p2.metric("Z-Score Prix", z_price, delta="Surchargé" if z_price > 1.5 else "Sous-évalué", delta_color=z_color)
-            
-            # Logique de signal
-            signal = "Attendre"
-            if z_price < 0: signal = "ACHAT (Value) 🔥"
-            elif z_price > 2: signal = "Prise de Profit ⚠️"
-            else: signal = "Tendance Saine ✅"
-            
-            p3.write(f"**Signal :**\n{signal}")
+        opportunities.append({
+            'Paire': f"{h['Symbol']}/{d['Symbol']}",
+            'Div. Macro': round(macro_div, 2),
+            'Prix Actuel': price,
+            'Z-Score Prix (2y)': z_price,
+            'Signal Tactique': signal
+        })
+
+if opportunities:
+    opp_df = pd.DataFrame(opportunities).sort_values(by='Div. Macro', ascending=False)
+    
+    # Affichage sous forme de colonnes pour lisibilité
+    for i, row in opp_df.iterrows():
+        with st.container():
+            c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+            c1.markdown(f"### {row['Paire']}")
+            c2.metric("Div. Macro", row['Div. Macro'])
+            c3.metric("Z-Score Prix", row['Z-Score Prix (2y)'], 
+                      delta="Sous-évalué" if row['Z-Score Prix (2y)'] < 0 else "Cher",
+                      delta_color="normal" if row['Z-Score Prix (2y)'] < 0 else "inverse")
+            c4.info(f"**Diagnostic :** {row['Signal Tactique']}")
             st.write("---")
 
-with tab3:
-    st.subheader("Données Fondamentales Complètes")
-    st.dataframe(df_macro.style.background_gradient(cmap='RdYlGn', subset=['Macro Score', 'Z-Rate']), use_container_width=True)
-    
-    st.markdown("### 📘 Guide de lecture des opportunités")
-    st.write("""
-    1. **Convergence (Le Trade de Valeur) :** Si la Macro est très positive mais que le Z-Score du prix est négatif (prix bas), c'est une anomalie de marché. Le prix finira par remonter pour rejoindre ses fondamentaux.
-    2. **Momentum (Le Trade de Tendance) :** Si la Macro est positive et le Z-Score du prix est entre 0 et 1.5, la tendance est saine et confirmée.
-    3. **Saturation :** Si le Z-Score du prix dépasse 2.0, le mouvement est peut-être épuisé à court terme malgré de bons fondamentaux.
-    """)
-
-st.caption("Données : FRED St Louis & Yahoo Finance API. Les Z-Scores Prix sont calculés sur une fenêtre de 500 jours de trading.")
+st.caption("Source : FRED St-Louis (Macro) & Yahoo Finance (Prix). Le Z-Score Prix compare le prix actuel à sa moyenne sur les 500 derniers jours.")
